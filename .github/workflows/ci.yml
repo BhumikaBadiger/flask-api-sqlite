@@ -1,3 +1,4 @@
+
 name: Flask API CI/CD
 
 on:
@@ -9,6 +10,7 @@ on:
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 jobs:
   test-build-publish:
@@ -48,3 +50,25 @@ jobs:
           context: .
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: ghcr.io/bhumikabadiger/flask-api-sqlite:latest
+
+      - name: Configure AWS credentials using OIDC
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Package tracked source files
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git archive --format=zip \
+            --output="flask-api-source-${GITHUB_SHA}.zip" HEAD
+
+      - name: Upload source artifact to S3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          aws s3 cp \
+            "flask-api-source-${GITHUB_SHA}.zip" \
+            "s3://bhumika-devops-lab-2026/flask-api-sqlite/artifacts/${GITHUB_SHA}.zip" \
+            --region us-east-1

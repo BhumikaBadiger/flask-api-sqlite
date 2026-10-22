@@ -2,8 +2,10 @@
 from flask import Flask, request, jsonify
 import sqlite3
 from contextlib import contextmanager
+from prometheus_flask_exporter import PrometheusMetrics
 
 app = Flask(__name__)
+metrics = PrometheusMetrics(app)
 DB_NAME = "tasks.db"
 
 

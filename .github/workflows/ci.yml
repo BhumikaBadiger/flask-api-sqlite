@@ -49,7 +49,9 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-          tags: ghcr.io/bhumikabadiger/flask-api-sqlite:latest
+          tags: |
+            ghcr.io/bhumikabadiger/flask-api-sqlite:latest
+            ghcr.io/bhumikabadiger/flask-api-sqlite:${{ github.sha }}
 
       - name: Configure AWS credentials using OIDC
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -72,3 +74,148 @@ jobs:
             "flask-api-source-${GITHUB_SHA}.zip" \
             "s3://bhumika-devops-lab-2026/flask-api-sqlite/artifacts/${GITHUB_SHA}.zip" \
             --region us-east-1
+
+      - name: Deploy to EC2 through SSM
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          IMAGE: ghcr.io/bhumikabadiger/flask-api-sqlite:${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > deploy.sh <<'DEPLOY_SCRIPT'
+          #!/bin/bash
+          set -Eeuo pipefail
+
+          IMAGE="ghcr.io/bhumikabadiger/flask-api-sqlite:${GITHUB_SHA}"
+          OLD_IMAGE=""
+
+          if docker inspect flask-api >/dev/null 2>&1; then
+            OLD_IMAGE=$(docker inspect --format='{{.Config.Image}}' flask-api)
+
+            if docker exec flask-api test -f /app/tasks.db; then
+              mkdir -p /opt/flask-api
+              docker cp flask-api:/app/tasks.db /opt/flask-api/tasks.db
+            fi
+          fi
+
+          mkdir -p /opt/flask-api
+          touch /opt/flask-api/tasks.db
+
+          # Pull first so a failed download does not stop the current app.
+          docker pull "$IMAGE"
+
+          docker rm -f flask-api 2>/dev/null || true
+
+          start_app() {
+            docker run -d \
+              --name flask-api \
+              --restart unless-stopped \
+              -p 80:5000 \
+              -v /opt/flask-api/tasks.db:/app/tasks.db \
+              "$1"
+          }
+
+          start_app "$IMAGE"
+
+          for attempt in $(seq 1 12); do
+            if curl -fsS http://127.0.0.1/health; then
+              echo
+              echo "Deployment healthy: $IMAGE"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "New deployment failed health checks."
+
+          docker logs --tail 100 flask-api || true
+          docker rm -f flask-api 2>/dev/null || true
+
+          if [ -n "$OLD_IMAGE" ]; then
+            echo "Attempting rollback to $OLD_IMAGE"
+            start_app "$OLD_IMAGE"
+
+            for attempt in $(seq 1 12); do
+              if curl -fsS http://127.0.0.1/health; then
+                echo
+                echo "Rollback healthy, but deployment failed."
+                exit 1
+              fi
+              sleep 5
+            done
+          fi
+
+          echo "Deployment and rollback health checks failed."
+          exit 1
+          DEPLOY_SCRIPT
+
+          # Embed the commit SHA into the remote script.
+          sed -i "s/\${GITHUB_SHA}/${GITHUB_SHA}/g" deploy.sh
+          SCRIPT_B64=$(base64 -w 0 deploy.sh)
+          PARAMETERS=$(jq -cn --arg cmd \
+            "echo '$SCRIPT_B64' | base64 -d > /tmp/flask-api-deploy.sh && bash /tmp/flask-api-deploy.sh" \
+            '{commands:[$cmd]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region ap-south-2 \
+            --instance-ids i-0a92d111a5e871b1e \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy Flask API ${GITHUB_SHA}" \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM command ID: $COMMAND_ID"
+
+          for attempt in $(seq 1 36); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region ap-south-2 \
+              --command-id "$COMMAND_ID" \
+              --instance-id i-0a92d111a5e871b1e \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                break
+                ;;
+              Failed|Cancelled|TimedOut|Undeliverable|Terminated)
+                aws ssm get-command-invocation \
+                  --region ap-south-2 \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id i-0a92d111a5e871b1e \
+                  --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+                  --output json || true
+                exit 1
+                ;;
+            esac
+
+            sleep 5
+          done
+
+          if [ "$STATUS" != "Success" ]; then
+            echo "Timed out waiting for deployment."
+            exit 1
+          fi
+
+          aws ssm get-command-invocation \
+            --region ap-south-2 \
+            --command-id "$COMMAND_ID" \
+            --instance-id i-0a92d111a5e871b1e \
+            --query '{Status:Status,Output:StandardOutputContent,Errors:StandardErrorContent}' \
+            --output json
+
+      - name: Verify public health endpoint
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error \
+              http://18.60.222.214/health; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1

@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-api-demo
+  labels:
+    app: flask-api-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flask-api-demo
+  template:
+    metadata:
+      labels:
+        app: flask-api-demo
+    spec:
+      containers:
+        - name: flask-api
+          image: ghcr.io/bhumikabadiger/flask-api-sqlite:latest
+          ports:
+            - containerPort: 5000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flask-api-demo
+spec:
+  selector:
+    app: flask-api-demo
+  ports:
+    - port: 80
+      targetPort: 5000
+  type: ClusterIP
